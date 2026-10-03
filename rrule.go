@@ -133,7 +133,9 @@ type RRule struct {
 	bysecond                []int
 	byeaster                []int
 	timeset                 []time.Time
-	len                     int
+	// Factorized BYSETPOS is supported by YEARLY, MONTHLY, WEEKLY, and DAILY.
+	factorizedBysetPos bool
+	len                int
 }
 
 // NewRRule construct a new RRule instance
@@ -240,7 +242,22 @@ func buildRRule(arg ROption) RRule {
 	// Reset the timeset value
 	r.timeset = nil
 
-	if r.freq < HOURLY {
+	factorized := false
+	if supportsFactorizedBySetPos(r.freq) && len(r.bysetpos) != 0 {
+		hours, hoursUnique := sortedUniqueInts(r.byhour)
+		minutes, minutesUnique := sortedUniqueInts(r.byminute)
+		seconds, secondsUnique := sortedUniqueInts(r.bysecond)
+
+		if hoursUnique && minutesUnique && secondsUnique &&
+			timeDimensionsOrderSafely(hours, minutes, seconds, r.dtstart.Location()) {
+			r.byhour = hours
+			r.byminute = minutes
+			r.bysecond = seconds
+			r.factorizedBysetPos = true
+			factorized = true
+		}
+	}
+	if !factorized && supportsFactorizedBySetPos(r.freq) {
 		r.timeset = make([]time.Time, 0, len(r.byhour)*len(r.byminute)*len(r.bysecond))
 		for _, hour := range r.byhour {
 			for _, minute := range r.byminute {
@@ -254,6 +271,67 @@ func buildRRule(arg ROption) RRule {
 
 	r.Options = arg
 	return r
+}
+
+// supportsFactorizedBySetPos reports the frequencies whose complete recurrence
+// period can be addressed as filtered dates multiplied by one daily time set.
+// HOURLY, MINUTELY, and SECONDLY generate their time sets per iteration, so
+// they keep the original expansion path.
+func supportsFactorizedBySetPos(freq Frequency) bool {
+	switch freq {
+	case YEARLY, MONTHLY, WEEKLY, DAILY:
+		return true
+	default:
+		return false
+	}
+}
+
+func sortedUniqueInts(values []int) ([]int, bool) {
+	if len(values) == 0 {
+		return nil, true
+	}
+
+	result := append([]int(nil), values...)
+	sort.Ints(result)
+	write := 1
+	for read := 1; read < len(result); read++ {
+		if result[read] == result[write-1] {
+			continue
+		}
+		result[write] = result[read]
+		write++
+	}
+	return result[:write], write == len(values)
+}
+
+func timeDimensionsOrderSafely(hours, minutes, seconds []int, location *time.Location) bool {
+	if len(hours) == 0 || len(minutes) == 0 || len(seconds) == 0 {
+		return false
+	}
+
+	// The original time set is constructed with year-one dates and then
+	// sorted. Constant base offsets and unchanged clock fields make that order
+	// identical to the sorted hour/minute/second dimensions.
+	first := time.Date(1, time.January, 1, hours[0], minutes[0], seconds[0], 0, location)
+	_, expectedOffset := first.Zone()
+	var previous time.Time
+
+	for _, hour := range hours {
+		for _, minute := range minutes {
+			for _, index := range []int{0, len(seconds) - 1} {
+				second := seconds[index]
+				current := time.Date(1, time.January, 1, hour, minute, second, 0, location)
+				_, offset := current.Zone()
+				currentHour, currentMinute, currentSecond := current.Clock()
+				if offset != expectedOffset || currentHour != hour || currentMinute != minute || currentSecond != second ||
+					!previous.IsZero() && current.Before(previous) {
+					return false
+				}
+				previous = current
+			}
+		}
+	}
+	return true
 }
 
 // validateBounds checks the RRule's options are within the boundaries defined
@@ -612,7 +690,12 @@ func (iterator *rIterator) generate() {
 		}
 
 		// Output results
-		if len(r.bysetpos) != 0 && len(iterator.timeset) != 0 {
+		if r.factorizedBysetPos {
+			poslist := iterator.factorBySetPos(dayset)
+			if iterator.appendResults(poslist) {
+				return
+			}
+		} else if len(r.bysetpos) != 0 && len(iterator.timeset) != 0 {
 			var poslist []time.Time
 			for _, pos := range r.bysetpos {
 				var daypos, timepos int
@@ -642,23 +725,8 @@ func (iterator *rIterator) generate() {
 				}
 			}
 			sort.Sort(timeSlice(poslist))
-			for _, res := range poslist {
-				if !r.until.IsZero() && res.After(r.until) {
-					r.len = iterator.total
-					iterator.finished = true
-					return
-				} else if !res.Before(r.dtstart) {
-					iterator.total++
-					iterator.remain.Append(res)
-					if iterator.count != 0 {
-						iterator.count--
-						if iterator.count == 0 {
-							r.len = iterator.total
-							iterator.finished = true
-							return
-						}
-					}
-				}
+			if iterator.appendResults(poslist) {
+				return
 			}
 		} else {
 			for _, day := range dayset {
@@ -672,21 +740,8 @@ func (iterator *rIterator) generate() {
 					res := time.Date(dateYear, dateMonth, dateDay,
 						tempHour, tempMinute, tempSecond,
 						timeTemp.Nanosecond(), timeTemp.Location())
-					if !r.until.IsZero() && res.After(r.until) {
-						r.len = iterator.total
-						iterator.finished = true
+					if iterator.appendResult(res) {
 						return
-					} else if !res.Before(r.dtstart) {
-						iterator.total++
-						iterator.remain.Append(res)
-						if iterator.count != 0 {
-							iterator.count--
-							if iterator.count == 0 {
-								r.len = iterator.total
-								iterator.finished = true
-								return
-							}
-						}
 					}
 				}
 			}
@@ -823,6 +878,98 @@ func (iterator *rIterator) generate() {
 			}
 		}
 	}
+}
+
+func (iterator *rIterator) factorBySetPos(dayset []optInt) []time.Time {
+	r := iterator.ii.rrule
+	dayCount := 0
+	for _, day := range dayset {
+		if day.Defined {
+			dayCount++
+		}
+	}
+
+	minuteCount := len(r.byminute)
+	secondCount := len(r.bysecond)
+	timeCount := len(r.byhour) * minuteCount * secondCount
+	totalCount := dayCount * timeCount
+	poslist := make([]time.Time, 0, len(r.bysetpos))
+
+	for _, pos := range r.bysetpos {
+		rank := pos - 1
+		if pos < 0 {
+			rank = totalCount + pos
+		}
+		if rank < 0 || rank >= totalCount {
+			continue
+		}
+
+		dayRank, timeRank := rank/timeCount, rank%timeCount
+		hourRank, remainder := timeRank/(minuteCount*secondCount), timeRank%(minuteCount*secondCount)
+		minuteRank, secondRank := remainder/secondCount, remainder%secondCount
+
+		dayIndex, ok := nthDefinedDay(dayset, dayRank)
+		if !ok {
+			continue
+		}
+		hour, minute, second := r.byhour[hourRank], r.byminute[minuteRank], r.bysecond[secondRank]
+		timeTemp := time.Date(1, time.January, 1, hour, minute, second, 0, r.dtstart.Location())
+
+		dateYear, dateMonth, dateDay := iterator.ii.firstyday.AddDate(0, 0, dayIndex).Date()
+		tempHour, tempMinute, tempSecond := timeTemp.Clock()
+		res := time.Date(dateYear, dateMonth, dateDay,
+			tempHour, tempMinute, tempSecond,
+			timeTemp.Nanosecond(), timeTemp.Location())
+		if !timeContains(poslist, res) {
+			poslist = append(poslist, res)
+		}
+	}
+
+	sort.Sort(timeSlice(poslist))
+	return poslist
+}
+
+func nthDefinedDay(dayset []optInt, rank int) (int, bool) {
+	for _, day := range dayset {
+		if !day.Defined {
+			continue
+		}
+		if rank == 0 {
+			return day.Int, true
+		}
+		rank--
+	}
+	return 0, false
+}
+
+func (iterator *rIterator) appendResults(results []time.Time) bool {
+	for _, res := range results {
+		if iterator.appendResult(res) {
+			return true
+		}
+	}
+	return false
+}
+
+func (iterator *rIterator) appendResult(res time.Time) bool {
+	r := iterator.ii.rrule
+	if !r.until.IsZero() && res.After(r.until) {
+		r.len = iterator.total
+		iterator.finished = true
+		return true
+	} else if !res.Before(r.dtstart) {
+		iterator.total++
+		iterator.remain.Append(res)
+		if iterator.count != 0 {
+			iterator.count--
+			if iterator.count == 0 {
+				r.len = iterator.total
+				iterator.finished = true
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (iterator *rIterator) fillDaySetMonotonic(start, end int) {
