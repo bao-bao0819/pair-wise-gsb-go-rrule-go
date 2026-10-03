@@ -173,6 +173,42 @@ func ExampleStrToRRuleSet() {
 
 For more examples see [python-dateutil](http://labix.org/python-dateutil/) documentation.
 
+## Leap seconds
+
+`time.Time` cannot represent UTC `23:59:60`, so ordinary `RRule` iterators keep
+returning ordinary seconds. Use `LeapSecondRRule` when the caller has a finite,
+already verified table of positive UTC leap seconds:
+
+```go
+table, err := rrule.NewLeapSecondTable(
+    time.Date(2020, time.June, 30, 0, 0, 0, 0, time.UTC),
+)
+if err != nil {
+    log.Fatal(err)
+}
+
+rule, err := rrule.NewLeapSecondRRule(rrule.LeapSecondROption{
+    ROption: rrule.ROption{
+        Freq:    rrule.SECONDLY,
+        Dtstart: time.Date(2020, time.June, 30, 23, 59, 59, 0, time.UTC),
+        Count:   3,
+    },
+}, table)
+if err != nil {
+    log.Fatal(err)
+}
+
+for _, occurrence := range rule.All() {
+    // 2020-06-30T23:59:59Z, 2020-06-30T23:59:60Z, 2020-07-01T00:00:00Z
+    fmt.Println(occurrence)
+}
+```
+
+`BYSECOND=60` only produces a result on dates present in the supplied table.
+A date absent from the table means that this finite table has no record for it;
+it is not treated as proof that the date has no leap second. Non-UTC locations
+and negative leap seconds are rejected.
+
 ## License
 
 Gear is licensed under the [MIT](https://github.com/teambition/gear/blob/master/LICENSE) license.

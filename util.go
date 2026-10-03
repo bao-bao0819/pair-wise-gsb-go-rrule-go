@@ -66,15 +66,6 @@ func contains(list []int, elem int) bool {
 	return false
 }
 
-func timeContains(list []time.Time, elem time.Time) bool {
-	for _, t := range list {
-		if t.Equal(elem) {
-			return true
-		}
-	}
-	return false
-}
-
 func repeat(value, count int) []int {
 	result := []int{}
 	for i := 0; i < count; i++ {

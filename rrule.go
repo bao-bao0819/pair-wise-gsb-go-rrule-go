@@ -131,9 +131,12 @@ type RRule struct {
 	byhour                  []int
 	byminute                []int
 	bysecond                []int
+	requestedBysecond       []int
 	byeaster                []int
-	timeset                 []time.Time
+	timeset                 []timeSpec
 	len                     int
+	leapSeconds             LeapSecondTable
+	untilValue              occurrenceValue
 }
 
 // NewRRule construct a new RRule instance
@@ -236,23 +239,25 @@ func buildRRule(arg ROption) RRule {
 	} else {
 		r.bysecond = arg.Bysecond
 	}
+	r.requestedBysecond = arg.Bysecond
 
 	// Reset the timeset value
 	r.timeset = nil
 
 	if r.freq < HOURLY {
-		r.timeset = make([]time.Time, 0, len(r.byhour)*len(r.byminute)*len(r.bysecond))
+		r.timeset = make([]timeSpec, 0, len(r.byhour)*len(r.byminute)*len(r.bysecond))
 		for _, hour := range r.byhour {
 			for _, minute := range r.byminute {
 				for _, second := range r.bysecond {
-					r.timeset = append(r.timeset, time.Date(1, 1, 1, hour, minute, second, 0, r.dtstart.Location()))
+					r.timeset = append(r.timeset, newTimeSpec(hour, minute, second, r.dtstart.Location()))
 				}
 			}
 		}
-		sort.Sort(timeSlice(r.timeset))
+		sort.Sort(timeSpecSlice(r.timeset))
 	}
 
 	r.Options = arg
+	r.untilValue = occurrenceValueFromTime(r.until)
 	return r
 }
 
@@ -261,13 +266,21 @@ func buildRRule(arg ROption) RRule {
 // as going outside these bounds trivially will never have any dates. This can catch
 // obvious user error.
 func validateBounds(arg ROption) error {
+	return validateBoundsWithLeapSeconds(arg, false)
+}
+
+func validateBoundsWithLeapSeconds(arg ROption, allowLeapSecond bool) error {
+	maxSecond := 59
+	if allowLeapSecond {
+		maxSecond = 60
+	}
 	bounds := []struct {
 		field     []int
 		param     string
 		bound     []int
 		plusMinus bool // If the bound also applies for -x to -y.
 	}{
-		{arg.Bysecond, "bysecond", []int{0, 59}, false},
+		{arg.Bysecond, "bysecond", []int{0, maxSecond}, false},
 		{arg.Byminute, "byminute", []int{0, 59}, false},
 		{arg.Byhour, "byhour", []int{0, 23}, false},
 		{arg.Bymonthday, "bymonthday", []int{1, 31}, true},
@@ -523,33 +536,53 @@ func (info *iterInfo) calcDaySet(freq Frequency, year int, month time.Month, day
 	}
 }
 
-func (info *iterInfo) fillTimeSet(set *[]time.Time, freq Frequency, hour, minute, second int) {
+func (info *iterInfo) fillTimeSet(set *[]timeSpec, freq Frequency, year int, month time.Month, day, hour, minute, second int) bool {
 	switch freq {
 	case HOURLY:
 		prepareTimeSet(set, len(info.rrule.byminute)*len(info.rrule.bysecond))
 		for _, minute := range info.rrule.byminute {
 			for _, second := range info.rrule.bysecond {
-				*set = append(*set, time.Date(1, 1, 1, hour, minute, second, 0, info.rrule.dtstart.Location()))
+				*set = append(*set, newTimeSpec(hour, minute, second, info.rrule.dtstart.Location()))
 			}
 		}
-		sort.Sort(timeSlice(*set))
+		leapCandidate := false
+		if info.rrule.leapSeconds != nil &&
+			contains(info.rrule.requestedBysecond, 60) &&
+			hour == 23 && contains(info.rrule.byminute, 59) &&
+			info.rrule.leapSeconds.hasDate(year, month, day) {
+			*set = append(*set, newTimeSpec(hour, 59, 60, info.rrule.dtstart.Location()))
+			leapCandidate = true
+		}
+		sort.Sort(timeSpecSlice(*set))
+		return leapCandidate
 	case MINUTELY:
 		prepareTimeSet(set, len(info.rrule.bysecond))
 		for _, second := range info.rrule.bysecond {
-			*set = append(*set, time.Date(1, 1, 1, hour, minute, second, 0, info.rrule.dtstart.Location()))
+			*set = append(*set, newTimeSpec(hour, minute, second, info.rrule.dtstart.Location()))
 		}
-		sort.Sort(timeSlice(*set))
+		if info.rrule.leapSeconds != nil &&
+			contains(info.rrule.requestedBysecond, 60) &&
+			hour == 23 && minute == 59 &&
+			info.rrule.leapSeconds.hasDate(year, month, day) {
+			*set = append(*set, newTimeSpec(hour, minute, 60, info.rrule.dtstart.Location()))
+			sort.Sort(timeSpecSlice(*set))
+			return true
+		}
+		sort.Sort(timeSpecSlice(*set))
+		return false
 	case SECONDLY:
 		prepareTimeSet(set, 1)
-		*set = append(*set, time.Date(1, 1, 1, hour, minute, second, 0, info.rrule.dtstart.Location()))
+		*set = append(*set, newTimeSpec(hour, minute, second, info.rrule.dtstart.Location()))
+		return false
 	default:
 		prepareTimeSet(set, 0)
+		return false
 	}
 }
 
-func prepareTimeSet(set *[]time.Time, length int) {
+func prepareTimeSet(set *[]timeSpec, length int) {
 	if len(*set) < length {
-		*set = make([]time.Time, 0, length)
+		*set = make([]timeSpec, 0, length)
 		return
 	}
 
@@ -558,20 +591,23 @@ func prepareTimeSet(set *[]time.Time, length int) {
 
 // rIterator is a iterator of RRule
 type rIterator struct {
-	year     int
-	month    time.Month
-	day      int
-	hour     int
-	minute   int
-	second   int
-	weekday  int
-	ii       iterInfo
-	timeset  []time.Time
-	total    int
-	count    int
-	remain   reusingRemainSlice
-	finished bool
-	dayset   []optInt
+	year                   int
+	month                  time.Month
+	day                    int
+	hour                   int
+	minute                 int
+	second                 int
+	weekday                int
+	ii                     iterInfo
+	timeset                []timeSpec
+	total                  int
+	count                  int
+	remain                 reusingOccurrenceSlice
+	finished               bool
+	dayset                 []optInt
+	leapSecondProxy        bool
+	leapSecondCandidate    bool
+	initialTimeSetConsumed bool
 }
 
 func (iterator *rIterator) generate() {
@@ -613,8 +649,42 @@ func (iterator *rIterator) generate() {
 
 		// Output results
 		if len(r.bysetpos) != 0 && len(iterator.timeset) != 0 {
-			var poslist []time.Time
+			var poslist []occurrenceValue
 			for _, pos := range r.bysetpos {
+				if r.leapSeconds != nil {
+					var candidates []occurrenceValue
+					for _, day := range dayset {
+						if !day.Defined {
+							continue
+						}
+						i := day.Int
+						dateYear, dateMonth, dateDay := iterator.ii.firstyday.AddDate(0, 0, i).Date()
+						for _, timeTemp := range iterator.timeset {
+							if iterator.leapSecondProxy && !contains(r.requestedBysecond, timeTemp.second) {
+								continue
+							}
+							res, ok := occurrenceValueAt(dateYear, dateMonth, dateDay, timeTemp, r.leapSeconds)
+							if ok {
+								candidates = append(candidates, res)
+							}
+						}
+					}
+					sort.Sort(occurrenceValueSlice(candidates))
+					index := pos
+					if index < 0 {
+						index += len(candidates)
+					} else {
+						index--
+					}
+					if index >= 0 && index < len(candidates) {
+						res := candidates[index]
+						if !occurrenceValueContains(poslist, res) {
+							poslist = append(poslist, res)
+						}
+					}
+					continue
+				}
+
 				var daypos, timepos int
 				if pos < 0 {
 					daypos, timepos = divmod(pos, len(iterator.timeset))
@@ -633,31 +703,28 @@ func (iterator *rIterator) generate() {
 				}
 				timeTemp := iterator.timeset[timepos]
 				dateYear, dateMonth, dateDay := iterator.ii.firstyday.AddDate(0, 0, i).Date()
-				tempHour, tempMinute, tempSecond := timeTemp.Clock()
-				res := time.Date(dateYear, dateMonth, dateDay,
-					tempHour, tempMinute, tempSecond,
-					timeTemp.Nanosecond(), timeTemp.Location())
-				if !timeContains(poslist, res) {
+				res := occurrenceValue{
+					year:     dateYear,
+					month:    dateMonth,
+					day:      dateDay,
+					hour:     timeTemp.hour,
+					minute:   timeTemp.minute,
+					second:   timeTemp.second,
+					location: timeTemp.location,
+				}
+				if !occurrenceValueContains(poslist, res) {
 					poslist = append(poslist, res)
 				}
 			}
-			sort.Sort(timeSlice(poslist))
+			sort.Sort(occurrenceValueSlice(poslist))
 			for _, res := range poslist {
-				if !r.until.IsZero() && res.After(r.until) {
+				if res.after(r.untilValue) {
 					r.len = iterator.total
 					iterator.finished = true
 					return
-				} else if !res.Before(r.dtstart) {
-					iterator.total++
-					iterator.remain.Append(res)
-					if iterator.count != 0 {
-						iterator.count--
-						if iterator.count == 0 {
-							r.len = iterator.total
-							iterator.finished = true
-							return
-						}
-					}
+				} else if !res.before(occurrenceValueFromTime(r.dtstart)) &&
+					iterator.appendOccurrence(res) {
+					return
 				}
 			}
 		} else {
@@ -668,25 +735,20 @@ func (iterator *rIterator) generate() {
 				i := day.Int
 				dateYear, dateMonth, dateDay := iterator.ii.firstyday.AddDate(0, 0, i).Date()
 				for _, timeTemp := range iterator.timeset {
-					tempHour, tempMinute, tempSecond := timeTemp.Clock()
-					res := time.Date(dateYear, dateMonth, dateDay,
-						tempHour, tempMinute, tempSecond,
-						timeTemp.Nanosecond(), timeTemp.Location())
-					if !r.until.IsZero() && res.After(r.until) {
+					res, ok := occurrenceValueAt(dateYear, dateMonth, dateDay, timeTemp, r.leapSeconds)
+					if !ok {
+						continue
+					}
+					if iterator.leapSecondProxy && !contains(r.requestedBysecond, timeTemp.second) {
+						continue
+					}
+					if res.after(r.untilValue) {
 						r.len = iterator.total
 						iterator.finished = true
 						return
-					} else if !res.Before(r.dtstart) {
-						iterator.total++
-						iterator.remain.Append(res)
-						if iterator.count != 0 {
-							iterator.count--
-							if iterator.count == 0 {
-								r.len = iterator.total
-								iterator.finished = true
-								return
-							}
-						}
+					} else if !res.before(occurrenceValueFromTime(r.dtstart)) &&
+						iterator.appendOccurrence(res) {
+						return
 					}
 				}
 			}
@@ -730,6 +792,14 @@ func (iterator *rIterator) generate() {
 			iterator.day += r.interval
 			fixday = true
 		} else if r.freq == HOURLY {
+			if iterator.leapSecondProxy && !iterator.initialTimeSetConsumed {
+				iterator.timeset = nil
+				iterator.initialTimeSetConsumed = true
+			}
+			if iterator.leapSecondCandidate {
+				iterator.leapSecondCandidate = false
+				iterator.second = 0
+			}
 			if filtered {
 				// Jump to one iteration before next day
 				iterator.hour += ((23 - iterator.hour) / r.interval) * r.interval
@@ -746,8 +816,22 @@ func (iterator *rIterator) generate() {
 					break
 				}
 			}
-			iterator.ii.fillTimeSet(&iterator.timeset, r.freq, iterator.hour, iterator.minute, iterator.second)
+			iterator.leapSecondCandidate = iterator.ii.fillTimeSet(&iterator.timeset, r.freq, iterator.year, iterator.month, iterator.day, iterator.hour, iterator.minute, iterator.second)
 		} else if r.freq == MINUTELY {
+			if iterator.leapSecondCandidate {
+				iterator.leapSecondCandidate = false
+				iterator.second = 0
+				iterator.minute++
+				if iterator.minute == 60 {
+					iterator.minute = 0
+					iterator.hour++
+					if iterator.hour == 24 {
+						iterator.hour = 0
+						iterator.day++
+						fixday = true
+					}
+				}
+			}
 			if filtered {
 				// Jump to one iteration before next day
 				iterator.minute += ((1439 - (iterator.hour*60 + iterator.minute)) / r.interval) * r.interval
@@ -770,37 +854,79 @@ func (iterator *rIterator) generate() {
 					break
 				}
 			}
-			iterator.ii.fillTimeSet(&iterator.timeset, r.freq, iterator.hour, iterator.minute, iterator.second)
+			iterator.leapSecondCandidate = iterator.ii.fillTimeSet(&iterator.timeset, r.freq, iterator.year, iterator.month, iterator.day, iterator.hour, iterator.minute, iterator.second)
 		} else if r.freq == SECONDLY {
-			if filtered {
-				// Jump to one iteration before next day
-				iterator.second += (((86399 - (iterator.hour*3600 + iterator.minute*60 + iterator.second)) / r.interval) * r.interval)
-			}
-			for {
-				iterator.second += r.interval
-				div, mod := divmod(iterator.second, 60)
-				if div != 0 {
-					iterator.second = mod
-					iterator.minute += div
-					div, mod = divmod(iterator.minute, 60)
-					if div != 0 {
-						iterator.minute = mod
-						iterator.hour += div
-						div, mod = divmod(iterator.hour, 24)
-						if div != 0 {
-							iterator.hour = mod
-							iterator.day += div
-							fixday = true
+			leapOnCurrentDate := r.leapSeconds != nil &&
+				r.leapSeconds.hasDate(iterator.year, iterator.month, iterator.day)
+			validLeapCandidateAtCurrentTime := leapOnCurrentDate &&
+				iterator.hour == 23 && iterator.minute == 59 && iterator.second == 59 &&
+				(len(r.byhour) == 0 || contains(r.byhour, 23)) &&
+				(len(r.byminute) == 0 || contains(r.byminute, 59))
+			if validLeapCandidateAtCurrentTime &&
+				(contains(r.bysecond, 60) || len(r.bysecond) == 0 && r.interval == 1) {
+				iterator.second = 60
+				iterator.ii.fillTimeSet(&iterator.timeset, r.freq, iterator.year, iterator.month, iterator.day, iterator.hour, iterator.minute, iterator.second)
+				iterator.leapSecondCandidate = true
+			} else {
+				postLeapCandidate := iterator.second == 60
+				if postLeapCandidate {
+					if iterator.hour == 23 && iterator.minute == 59 {
+						iterator.day++
+						iterator.hour = 0
+						iterator.minute = 0
+						iterator.second = 0
+						fixday = true
+					} else {
+						iterator.second = 0
+						iterator.minute++
+						if iterator.minute == 60 {
+							iterator.minute = 0
+							iterator.hour++
+							if iterator.hour == 24 {
+								iterator.hour = 0
+								iterator.day++
+								fixday = true
+							}
 						}
 					}
 				}
-				if (len(r.byhour) == 0 || contains(r.byhour, iterator.hour)) &&
-					(len(r.byminute) == 0 || contains(r.byminute, iterator.minute)) &&
-					(len(r.bysecond) == 0 || contains(r.bysecond, iterator.second)) {
-					break
+
+				if !postLeapCandidate && filtered {
+					// Jump to one iteration before next day
+					iterator.second += (((86399 - (iterator.hour*3600 + iterator.minute*60 + iterator.second)) / r.interval) * r.interval)
 				}
+				for {
+					step := r.interval
+					if postLeapCandidate {
+						step--
+						postLeapCandidate = false
+					}
+					iterator.second += step
+					div, mod := divmod(iterator.second, 60)
+					if div != 0 {
+						iterator.second = mod
+						iterator.minute += div
+						div, mod = divmod(iterator.minute, 60)
+						if div != 0 {
+							iterator.minute = mod
+							iterator.hour += div
+							div, mod = divmod(iterator.hour, 24)
+							if div != 0 {
+								iterator.hour = mod
+								iterator.day += div
+								fixday = true
+							}
+						}
+					}
+					if (len(r.byhour) == 0 || contains(r.byhour, iterator.hour)) &&
+						(len(r.byminute) == 0 || contains(r.byminute, iterator.minute)) &&
+						(len(r.bysecond) == 0 || contains(r.bysecond, iterator.second) ||
+							r.leapSeconds != nil && iterator.second == 59 && contains(r.bysecond, 60)) {
+						break
+					}
+				}
+				iterator.leapSecondCandidate = iterator.ii.fillTimeSet(&iterator.timeset, r.freq, iterator.year, iterator.month, iterator.day, iterator.hour, iterator.minute, iterator.second)
 			}
-			iterator.ii.fillTimeSet(&iterator.timeset, r.freq, iterator.hour, iterator.minute, iterator.second)
 		}
 		if fixday && iterator.day > 28 {
 			daysinmonth := daysIn(iterator.month, iterator.year)
@@ -825,6 +951,21 @@ func (iterator *rIterator) generate() {
 	}
 }
 
+func (iterator *rIterator) appendOccurrence(value occurrenceValue) bool {
+	iterator.total++
+	iterator.remain.Append(value)
+	if iterator.count != 0 {
+		iterator.count--
+		if iterator.count == 0 {
+			r := iterator.ii.rrule
+			r.len = iterator.total
+			iterator.finished = true
+			return true
+		}
+	}
+	return false
+}
+
 func (iterator *rIterator) fillDaySetMonotonic(start, end int) {
 	desiredLen := end - start
 
@@ -843,28 +984,28 @@ func (iterator *rIterator) fillDaySetMonotonic(start, end int) {
 }
 
 // next returns next occurrence and true if it exists, else zero value and false
-func (iterator *rIterator) next() (time.Time, bool) {
+func (iterator *rIterator) nextValue() (occurrenceValue, bool) {
 	iterator.generate()
 	return iterator.remain.Pop()
 }
 
-type reusingRemainSlice struct {
-	storage []time.Time
-	backup  []time.Time
+type reusingOccurrenceSlice struct {
+	storage []occurrenceValue
+	backup  []occurrenceValue
 }
 
-func (s reusingRemainSlice) Len() int {
+func (s reusingOccurrenceSlice) Len() int {
 	return len(s.storage)
 }
 
-func (s *reusingRemainSlice) Append(t time.Time) {
-	s.storage = append(s.storage, t)
+func (s *reusingOccurrenceSlice) Append(value occurrenceValue) {
+	s.storage = append(s.storage, value)
 	s.backup = s.storage
 }
 
-func (s *reusingRemainSlice) Pop() (ret time.Time, ok bool) {
+func (s *reusingOccurrenceSlice) Pop() (ret occurrenceValue, ok bool) {
 	if len(s.storage) == 0 {
-		return time.Time{}, false
+		return occurrenceValue{}, false
 	}
 
 	ret, s.storage = s.storage[0], s.storage[1:]
@@ -879,6 +1020,18 @@ func (s *reusingRemainSlice) Pop() (ret time.Time, ok bool) {
 
 // Iterator return an iterator for RRule
 func (r *RRule) Iterator() Next {
+	next := r.valueIterator()
+	return func() (time.Time, bool) {
+		value, ok := next()
+		if !ok {
+			return time.Time{}, false
+		}
+		result, err := value.time()
+		return result, err == nil
+	}
+}
+
+func (r *RRule) valueIterator() func() (occurrenceValue, bool) {
 	iterator := rIterator{}
 	iterator.year, iterator.month, iterator.day = r.dtstart.Date()
 	iterator.hour, iterator.minute, iterator.second = r.dtstart.Clock()
@@ -890,16 +1043,20 @@ func (r *RRule) Iterator() Next {
 	if r.freq < HOURLY {
 		iterator.timeset = r.timeset
 	} else {
+		iterator.leapSecondProxy = r.leapSeconds != nil &&
+			contains(r.Options.Bysecond, 60) && r.freq >= HOURLY
 		if r.freq >= HOURLY && len(r.byhour) != 0 && !contains(r.byhour, iterator.hour) ||
 			r.freq >= MINUTELY && len(r.byminute) != 0 && !contains(r.byminute, iterator.minute) ||
-			r.freq >= SECONDLY && len(r.bysecond) != 0 && !contains(r.bysecond, iterator.second) {
+			r.freq >= SECONDLY && len(r.bysecond) != 0 &&
+				!(contains(r.bysecond, iterator.second) ||
+					r.leapSeconds != nil && iterator.second == 59 && contains(r.bysecond, 60)) {
 			iterator.timeset = nil
 		} else {
-			iterator.ii.fillTimeSet(&iterator.timeset, r.freq, iterator.hour, iterator.minute, iterator.second)
+			iterator.leapSecondCandidate = iterator.ii.fillTimeSet(&iterator.timeset, r.freq, iterator.year, iterator.month, iterator.day, iterator.hour, iterator.minute, iterator.second)
 		}
 	}
 	iterator.count = r.count
-	return iterator.next
+	return iterator.nextValue
 }
 
 // All returns all occurrences of the RRule.
