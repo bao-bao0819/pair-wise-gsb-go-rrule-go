@@ -133,6 +133,7 @@ type RRule struct {
 	bysecond                []int
 	byeaster                []int
 	timeset                 []time.Time
+	timesetFactor           *timeSetFactor
 	len                     int
 }
 
@@ -239,21 +240,36 @@ func buildRRule(arg ROption) RRule {
 
 	// Reset the timeset value
 	r.timeset = nil
+	r.timesetFactor = nil
 
-	if r.freq < HOURLY {
-		r.timeset = make([]time.Time, 0, len(r.byhour)*len(r.byminute)*len(r.bysecond))
-		for _, hour := range r.byhour {
-			for _, minute := range r.byminute {
-				for _, second := range r.bysecond {
-					r.timeset = append(r.timeset, time.Date(1, 1, 1, hour, minute, second, 0, r.dtstart.Location()))
-				}
-			}
-		}
-		sort.Sort(timeSlice(r.timeset))
+	// Rules with BYSETPOS only need a few positions out of the intra-day
+	// time set per period, so keep the set factorized and locate the
+	// requested combinations by rank instead of materializing the full
+	// BYHOUR x BYMINUTE x BYSECOND cartesian product.
+	if len(r.bysetpos) != 0 {
+		r.timesetFactor = newTimeSetFactor(r.freq, r.byhour, r.byminute, r.bysecond)
+	}
+
+	if r.timesetFactor == nil && r.freq < HOURLY {
+		r.buildTimeSet()
 	}
 
 	r.Options = arg
 	return r
+}
+
+// buildTimeSet materializes the intra-day time set as the sorted cartesian
+// product of the BYHOUR, BYMINUTE and BYSECOND dimensions.
+func (r *RRule) buildTimeSet() {
+	r.timeset = make([]time.Time, 0, len(r.byhour)*len(r.byminute)*len(r.bysecond))
+	for _, hour := range r.byhour {
+		for _, minute := range r.byminute {
+			for _, second := range r.bysecond {
+				r.timeset = append(r.timeset, time.Date(1, 1, 1, hour, minute, second, 0, r.dtstart.Location()))
+			}
+		}
+	}
+	sort.Sort(timeSlice(r.timeset))
 }
 
 // validateBounds checks the RRule's options are within the boundaries defined
@@ -556,22 +572,135 @@ func prepareTimeSet(set *[]time.Time, length int) {
 	*set = (*set)[:0]
 }
 
+// timeSetFactor is a factorized view of a rule's intra-day time candidates:
+// the sorted, duplicate-free BYHOUR/BYMINUTE/BYSECOND dimensions that take
+// part in the rule's time set, combined lazily by rank instead of
+// materializing their cartesian product. Dimensions left out (nil) are the
+// ones the frequency iteration itself pins down (e.g. the hour for
+// FREQ=HOURLY).
+//
+// It is used for every frequency (YEARLY through SECONDLY) but only together
+// with BYSETPOS, where each period needs just a few positions of the full
+// set, so memory stays proportional to the dimension lengths plus the number
+// of requested positions rather than to the product of the dimensions.
+type timeSetFactor struct {
+	hours   []int
+	minutes []int
+	seconds []int
+	size    int
+}
+
+// newTimeSetFactor builds the factorized time set for freq from the given
+// BYHOUR/BYMINUTE/BYSECOND values, mirroring exactly the dimensions that
+// buildTimeSet and fillTimeSet would expand for that frequency:
+//   - YEARLY, MONTHLY, WEEKLY, DAILY: hours x minutes x seconds
+//   - HOURLY: minutes x seconds
+//   - MINUTELY: seconds
+//   - SECONDLY: a single, fully pinned time of day
+//
+// It returns nil when the factorized form cannot reproduce the materialized
+// time set exactly, i.e. when a participating dimension contains duplicate
+// values (the materialized set keeps duplicates, which affects the position
+// arithmetic); callers must then fall back to the materialized time set.
+func newTimeSetFactor(freq Frequency, byhour, byminute, bysecond []int) *timeSetFactor {
+	factor := &timeSetFactor{size: 1}
+	if freq < HOURLY {
+		factor.hours = byhour
+	}
+	if freq < MINUTELY {
+		factor.minutes = byminute
+	}
+	if freq < SECONDLY {
+		factor.seconds = bysecond
+	}
+	for _, dim := range []*[]int{&factor.hours, &factor.minutes, &factor.seconds} {
+		if *dim == nil {
+			continue
+		}
+		sorted, ok := sortedUnique(*dim)
+		if !ok {
+			return nil
+		}
+		*dim = sorted
+		factor.size *= len(sorted)
+	}
+	return factor
+}
+
+// sortedUnique returns a sorted copy of values, reporting whether all values
+// were unique.
+func sortedUnique(values []int) ([]int, bool) {
+	sorted := make([]int, len(values))
+	copy(sorted, values)
+	sort.Ints(sorted)
+	for i := 1; i < len(sorted); i++ {
+		if sorted[i] == sorted[i-1] {
+			return nil, false
+		}
+	}
+	return sorted, true
+}
+
+// clock maps a 0-based rank within the factorized time set to the
+// corresponding time of day, equivalent to indexing the sorted materialized
+// set. The hour/minute/second arguments supply the components pinned by the
+// frequency iteration for dimensions the factor leaves out.
+func (f *timeSetFactor) clock(rank, hour, minute, second int) (int, int, int) {
+	if len(f.seconds) != 0 {
+		second = f.seconds[rank%len(f.seconds)]
+		rank /= len(f.seconds)
+	}
+	if len(f.minutes) != 0 {
+		minute = f.minutes[rank%len(f.minutes)]
+		rank /= len(f.minutes)
+	}
+	if len(f.hours) != 0 {
+		hour = f.hours[rank%len(f.hours)]
+	}
+	return hour, minute, second
+}
+
 // rIterator is a iterator of RRule
 type rIterator struct {
-	year     int
-	month    time.Month
-	day      int
-	hour     int
-	minute   int
-	second   int
-	weekday  int
-	ii       iterInfo
-	timeset  []time.Time
-	total    int
-	count    int
-	remain   reusingRemainSlice
-	finished bool
-	dayset   []optInt
+	year         int
+	month        time.Month
+	day          int
+	hour         int
+	minute       int
+	second       int
+	weekday      int
+	ii           iterInfo
+	timeset      []time.Time
+	timesetReady bool
+	total        int
+	count        int
+	remain       reusingRemainSlice
+	finished     bool
+	dayset       []optInt
+}
+
+// refreshTimeSet prepares the intra-day time candidates for the current
+// period: it marks the factorized set usable, or materializes the timeset
+// for the current hour/minute/second when the rule has no factorized set.
+func (iterator *rIterator) refreshTimeSet() {
+	r := iterator.ii.rrule
+	if r.timesetFactor != nil {
+		iterator.timesetReady = true
+		return
+	}
+	iterator.ii.fillTimeSet(&iterator.timeset, r.freq, iterator.hour, iterator.minute, iterator.second)
+}
+
+// timeSetLen returns the number of intra-day time candidates available for
+// the current period.
+func (iterator *rIterator) timeSetLen() int {
+	if factor := iterator.ii.rrule.timesetFactor; factor != nil {
+		if !iterator.timesetReady {
+			return 0
+		}
+		return factor.size
+	}
+	return len(iterator.timeset)
 }
 
 func (iterator *rIterator) generate() {
@@ -612,14 +741,14 @@ func (iterator *rIterator) generate() {
 		}
 
 		// Output results
-		if len(r.bysetpos) != 0 && len(iterator.timeset) != 0 {
+		if len(r.bysetpos) != 0 && iterator.timeSetLen() != 0 {
 			var poslist []time.Time
 			for _, pos := range r.bysetpos {
 				var daypos, timepos int
 				if pos < 0 {
-					daypos, timepos = divmod(pos, len(iterator.timeset))
+					daypos, timepos = divmod(pos, iterator.timeSetLen())
 				} else {
-					daypos, timepos = divmod(pos-1, len(iterator.timeset))
+					daypos, timepos = divmod(pos-1, iterator.timeSetLen())
 				}
 				var temp []int
 				for _, day := range dayset {
@@ -631,12 +760,22 @@ func (iterator *rIterator) generate() {
 				if err != nil {
 					continue
 				}
-				timeTemp := iterator.timeset[timepos]
 				dateYear, dateMonth, dateDay := iterator.ii.firstyday.AddDate(0, 0, i).Date()
-				tempHour, tempMinute, tempSecond := timeTemp.Clock()
+				var tempHour, tempMinute, tempSecond, tempNsec int
+				var tempLoc *time.Location
+				if factor := r.timesetFactor; factor != nil {
+					tempHour, tempMinute, tempSecond = factor.clock(timepos,
+						iterator.hour, iterator.minute, iterator.second)
+					tempLoc = r.dtstart.Location()
+				} else {
+					timeTemp := iterator.timeset[timepos]
+					tempHour, tempMinute, tempSecond = timeTemp.Clock()
+					tempNsec = timeTemp.Nanosecond()
+					tempLoc = timeTemp.Location()
+				}
 				res := time.Date(dateYear, dateMonth, dateDay,
 					tempHour, tempMinute, tempSecond,
-					timeTemp.Nanosecond(), timeTemp.Location())
+					tempNsec, tempLoc)
 				if !timeContains(poslist, res) {
 					poslist = append(poslist, res)
 				}
@@ -746,7 +885,7 @@ func (iterator *rIterator) generate() {
 					break
 				}
 			}
-			iterator.ii.fillTimeSet(&iterator.timeset, r.freq, iterator.hour, iterator.minute, iterator.second)
+			iterator.refreshTimeSet()
 		} else if r.freq == MINUTELY {
 			if filtered {
 				// Jump to one iteration before next day
@@ -770,7 +909,7 @@ func (iterator *rIterator) generate() {
 					break
 				}
 			}
-			iterator.ii.fillTimeSet(&iterator.timeset, r.freq, iterator.hour, iterator.minute, iterator.second)
+			iterator.refreshTimeSet()
 		} else if r.freq == SECONDLY {
 			if filtered {
 				// Jump to one iteration before next day
@@ -800,7 +939,7 @@ func (iterator *rIterator) generate() {
 					break
 				}
 			}
-			iterator.ii.fillTimeSet(&iterator.timeset, r.freq, iterator.hour, iterator.minute, iterator.second)
+			iterator.refreshTimeSet()
 		}
 		if fixday && iterator.day > 28 {
 			daysinmonth := daysIn(iterator.month, iterator.year)
@@ -888,14 +1027,18 @@ func (r *RRule) Iterator() Next {
 	iterator.ii.rebuild(iterator.year, iterator.month)
 
 	if r.freq < HOURLY {
-		iterator.timeset = r.timeset
+		if r.timesetFactor != nil {
+			iterator.timesetReady = true
+		} else {
+			iterator.timeset = r.timeset
+		}
 	} else {
 		if r.freq >= HOURLY && len(r.byhour) != 0 && !contains(r.byhour, iterator.hour) ||
 			r.freq >= MINUTELY && len(r.byminute) != 0 && !contains(r.byminute, iterator.minute) ||
 			r.freq >= SECONDLY && len(r.bysecond) != 0 && !contains(r.bysecond, iterator.second) {
 			iterator.timeset = nil
 		} else {
-			iterator.ii.fillTimeSet(&iterator.timeset, r.freq, iterator.hour, iterator.minute, iterator.second)
+			iterator.refreshTimeSet()
 		}
 	}
 	iterator.count = r.count
