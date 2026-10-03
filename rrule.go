@@ -134,20 +134,26 @@ type RRule struct {
 	byeaster                []int
 	timeset                 []time.Time
 	len                     int
+	leapTable               *LeapSecondTable
+	leapUntil               *Occurrence
 }
+
+// LeapSecondNext is a generator of leap-second-aware occurrences.
+type LeapSecondNext func() (Occurrence, bool)
 
 // NewRRule construct a new RRule instance
 func NewRRule(arg ROption) (*RRule, error) {
 	if err := validateBounds(arg); err != nil {
 		return nil, err
 	}
-	r := buildRRule(arg)
+	r := buildRRule(arg, nil)
 	return &r, nil
 }
 
-func buildRRule(arg ROption) RRule {
+func buildRRule(arg ROption, leapTable *LeapSecondTable) RRule {
 	r := RRule{}
 	r.OrigOptions = arg
+	r.leapTable = leapTable
 	// FREQ default to YEARLY
 	r.freq = arg.Freq
 
@@ -245,6 +251,9 @@ func buildRRule(arg ROption) RRule {
 		for _, hour := range r.byhour {
 			for _, minute := range r.byminute {
 				for _, second := range r.bysecond {
+					if second == 60 && r.leapTable != nil {
+						continue
+					}
 					r.timeset = append(r.timeset, time.Date(1, 1, 1, hour, minute, second, 0, r.dtstart.Location()))
 				}
 			}
@@ -261,13 +270,17 @@ func buildRRule(arg ROption) RRule {
 // as going outside these bounds trivially will never have any dates. This can catch
 // obvious user error.
 func validateBounds(arg ROption) error {
+	return validateBoundsWithSecondLimit(arg, 59)
+}
+
+func validateBoundsWithSecondLimit(arg ROption, maxSecond int) error {
 	bounds := []struct {
 		field     []int
 		param     string
 		bound     []int
 		plusMinus bool // If the bound also applies for -x to -y.
 	}{
-		{arg.Bysecond, "bysecond", []int{0, 59}, false},
+		{arg.Bysecond, "bysecond", []int{0, maxSecond}, false},
 		{arg.Byminute, "byminute", []int{0, 59}, false},
 		{arg.Byhour, "byhour", []int{0, 23}, false},
 		{arg.Bymonthday, "bymonthday", []int{1, 31}, true},
@@ -529,6 +542,9 @@ func (info *iterInfo) fillTimeSet(set *[]time.Time, freq Frequency, hour, minute
 		prepareTimeSet(set, len(info.rrule.byminute)*len(info.rrule.bysecond))
 		for _, minute := range info.rrule.byminute {
 			for _, second := range info.rrule.bysecond {
+				if second == 60 && info.rrule.leapTable != nil {
+					continue
+				}
 				*set = append(*set, time.Date(1, 1, 1, hour, minute, second, 0, info.rrule.dtstart.Location()))
 			}
 		}
@@ -536,6 +552,9 @@ func (info *iterInfo) fillTimeSet(set *[]time.Time, freq Frequency, hour, minute
 	case MINUTELY:
 		prepareTimeSet(set, len(info.rrule.bysecond))
 		for _, second := range info.rrule.bysecond {
+			if second == 60 && info.rrule.leapTable != nil {
+				continue
+			}
 			*set = append(*set, time.Date(1, 1, 1, hour, minute, second, 0, info.rrule.dtstart.Location()))
 		}
 		sort.Sort(timeSlice(*set))
@@ -572,6 +591,8 @@ type rIterator struct {
 	remain   reusingRemainSlice
 	finished bool
 	dayset   []optInt
+	leap     *leapSecondState
+	ordinal  int64
 }
 
 func (iterator *rIterator) generate() {
@@ -580,7 +601,8 @@ func (iterator *rIterator) generate() {
 	}
 
 	r := iterator.ii.rrule
-	for iterator.remain.Len() == 0 {
+	for iterator.remain.Len() == 0 &&
+		(iterator.leap == nil || (len(iterator.leap.remain) == 0 && !iterator.leap.finished)) {
 		// Get dayset with the right frequency
 		setStart, setEnd := iterator.ii.calcDaySet(r.freq, iterator.year, iterator.month, iterator.day)
 		iterator.fillDaySetMonotonic(setStart, setEnd)
@@ -612,7 +634,14 @@ func (iterator *rIterator) generate() {
 		}
 
 		// Output results
-		if len(r.bysetpos) != 0 && len(iterator.timeset) != 0 {
+		if iterator.leap != nil {
+			if iterator.generateLeapSecondOccurrences(dayset, filtered) {
+				return
+			}
+			if r.freq == SECONDLY {
+				continue
+			}
+		} else if len(r.bysetpos) != 0 && len(iterator.timeset) != 0 {
 			var poslist []time.Time
 			for _, pos := range r.bysetpos {
 				var daypos, timepos int
@@ -902,6 +931,34 @@ func (r *RRule) Iterator() Next {
 	return iterator.next
 }
 
+func (r *RRule) leapSecondIterator(state *leapSecondState) LeapSecondNext {
+	iterator := rIterator{leap: state}
+	iterator.ii.rrule = r
+	state.iterator = &iterator
+	iterator.count = r.count
+
+	iterator.year, iterator.month, iterator.day = r.dtstart.Date()
+	iterator.hour, iterator.minute, iterator.second = r.dtstart.Clock()
+	iterator.weekday = toPyWeekday(r.dtstart.Weekday())
+
+	iterator.ii.rebuild(iterator.year, iterator.month)
+	serial := daysFromCivil(iterator.year, int(iterator.month), iterator.day)
+	iterator.ordinal = int64(serial)*86400 +
+		int64(state.table.leapCountBeforeSerial(serial)) +
+		int64(iterator.hour)*3600 + int64(iterator.minute)*60 + int64(iterator.second)
+
+	if r.freq < HOURLY {
+		iterator.timeset = r.timeset
+	} else if r.freq >= HOURLY && len(r.byhour) != 0 && !contains(r.byhour, iterator.hour) ||
+		r.freq >= MINUTELY && len(r.byminute) != 0 && !contains(r.byminute, iterator.minute) ||
+		r.freq >= SECONDLY && len(r.bysecond) != 0 && !contains(r.bysecond, iterator.second) {
+		iterator.timeset = nil
+	} else {
+		iterator.ii.fillTimeSet(&iterator.timeset, r.freq, iterator.hour, iterator.minute, iterator.second)
+	}
+	return state.next
+}
+
 // All returns all occurrences of the RRule.
 // It is only supported second precision.
 func (r *RRule) All() []time.Time {
@@ -939,7 +996,7 @@ func (r *RRule) After(dt time.Time, inc bool) time.Time {
 // Default to `time.Now().UTC().Truncate(time.Second)`.
 func (r *RRule) DTStart(dt time.Time) {
 	r.OrigOptions.Dtstart = dt.Truncate(time.Second)
-	*r = buildRRule(r.OrigOptions)
+	*r = buildRRule(r.OrigOptions, r.leapTable)
 }
 
 // GetDTStart gets DTSTART time for rrule
@@ -952,7 +1009,7 @@ func (r *RRule) GetDTStart() time.Time {
 // Default to `Dtstart.Add(time.Duration(1<<63 - 1))`, approximately 290 years.
 func (r *RRule) Until(ut time.Time) {
 	r.OrigOptions.Until = ut.Truncate(time.Second)
-	*r = buildRRule(r.OrigOptions)
+	*r = buildRRule(r.OrigOptions, r.leapTable)
 }
 
 // GetUntil gets UNTIL time for rrule

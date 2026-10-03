@@ -127,6 +127,42 @@ func ExampleSet() {
 }
 ```
 
+### Leap seconds
+
+The ordinary `RRule` API continues to return `time.Time` values. Use `LeapSecondRRule` when an
+archive must preserve UTC `23:59:60`. The caller supplies a finite, already-verified table of
+positive leap second dates; the library does not download one.
+
+```go
+january, _ := rrule.NewLeapSecondDate(2100, time.January, 31)
+table, _ := rrule.NewLeapSecondTable(january)
+
+r, _ := rrule.NewLeapSecondRRule(rrule.LeapSecondROption{
+  ROption: rrule.ROption{
+    Freq:    rrule.SECONDLY,
+    Count:   3,
+    Dtstart: time.Date(2100, 1, 31, 23, 59, 59, 0, time.UTC),
+  },
+}, table)
+
+occurrences, _ := r.All()
+for _, occurrence := range occurrences {
+  fmt.Println(occurrence)
+  if occurrence.IsLeapSecond() {
+    _, err := occurrence.Time() // rrule.ErrLeapSecond
+    _ = err
+  }
+}
+// 2100-01-31T23:59:59Z
+// 2100-01-31T23:59:60Z
+// 2100-02-01T00:00:00Z
+```
+
+`BYSECOND=60` produces a candidate only when the rule reaches a date present in the supplied
+table. A date absent from the finite table means "no data for this date"; it must not be
+interpreted as confirmation that the date had no leap second. Leap-second evaluation is limited
+to UTC and positive leap seconds; negative leap seconds and non-UTC locations are rejected.
+
 ### rrule.StrToRRule
 
 ```go
