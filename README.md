@@ -173,6 +173,56 @@ func ExampleStrToRRuleSet() {
 
 For more examples see [python-dateutil](http://labix.org/python-dateutil/) documentation.
 
+### rrule.DateTime / rrule.TypedRRule / rrule.TypedSet
+
+The legacy API above stores every value as a `time.Time`, so a floating
+`DTSTART:20261003T090000` is parsed in a caller-supplied location (UTC by
+default) and a pure date `DTSTART;VALUE=DATE:20261003` is indistinguishable
+from midnight in that zone. The typed API preserves the original RFC 5545
+kind instead:
+
+- `rrule.KindDate` &mdash; `VALUE=DATE:20261003`, pure date with no time of day
+- `rrule.KindFloating` &mdash; `20261003T090000`, wall time with no zone; it is
+  never silently attached to `time.Local`
+- `rrule.KindTZID` &mdash; `TZID=America/New_York:20261003T090000`, local time
+  in the named zone
+- `rrule.KindUTC` &mdash; `20261003T090000Z`, absolute UTC time
+
+```go
+// Parse keeps the kind: date, floating, zoned and UTC stay distinct.
+r, err := rrule.StrToTypedRRule(
+	"DTSTART:20261003T090000\nRRULE:FREQ=DAILY;COUNT=3")
+
+sh, _ := time.LoadLocation("Asia/Shanghai")
+ak, _ := time.LoadLocation("Pacific/Auckland")
+
+// Floating rules need an explicit evaluation zone on every read.
+inShanghai, _ := r.All(sh)
+inAuckland, _ := r.All(ak)
+// Both slices carry the same wall clock (09:00:00), but the evaluated
+// instants differ by the zone offset.
+
+// Pure dates are computed on date boundaries and ignore time.Local.
+daily, _ := rrule.StrToTypedRRule(
+	"DTSTART;VALUE=DATE:20261003\nRRULE:FREQ=DAILY;COUNT=5;UNTIL=20261010")
+dates, _ := daily.All(nil) // []rrule.DateTime of KindDate
+
+// UNTIL is validated against DTSTART (DATE needs DATE, TZID needs UTC, ...)
+// and mismatches are rejected at construction time. RDATE follows the same
+// rule, while EXDATE only suppresses values of the exact same kind/TZID.
+set, _ := rrule.StrToTypedSet(strings.Join([]string{
+	"DTSTART;TZID=America/New_York:20261003T090000",
+	"RRULE:FREQ=DAILY;COUNT=5",
+	"EXDATE;TZID=America/New_York:20261005T090000",
+}, "\n"))
+
+// String round trips keep the kind and TZID.
+fmt.Println(r.String())
+```
+
+Use `rrule.FromTimeTime(t)` to classify a `time.Time`, `dt.InLocation(loc)`
+to evaluate a `DateTime`, and `dt.Kind()` / `dt.TZID()` to inspect it.
+
 ## License
 
 Gear is licensed under the [MIT](https://github.com/teambition/gear/blob/master/LICENSE) license.
