@@ -153,6 +153,44 @@ func ExampleStrToRRule() {
 }
 ```
 
+### rrule.AnalyzeEmpty
+
+`AnalyzeEmpty` is a read-only analysis that decides whether a rule can ever
+emit an occurrence, without iterating. It returns one of `HasWitness`,
+`EmptyProven` or `EmptyUnknown`.
+
+- `HasWitness` carries the first surviving date, which is also the first
+  result returned by the normal iterator.
+- `EmptyProven` lists the decisive rule components (e.g. `BYMONTHDAY=30` or
+  `INTERVAL=4`) via ablation, and reports whether the proof covers the whole
+  Gregorian/INTERVAL phase cycle or only the rule's effective horizon.
+- `EmptyUnknown` is returned for unsupported shapes (intraday time,
+  non-UTC, `HOURLY`/`MINUTELY`/`SECONDLY`, `BYEASTER`) or when the work
+  budget is exhausted (`AnalyzeBudget`).
+
+The analysis keeps the DTSTART/INTERVAL phase and combines it with the
+Gregorian 400-year cycle (146097 days) as a finite state space, so a large
+`INTERVAL` is handled exactly instead of being judged by a naive 400-year
+forward scan.
+
+```go
+r, _ := rrule.NewRRule(rrule.ROption{
+	Freq:       rrule.YEARLY,
+	Bymonth:    []int{2},
+	Bymonthday: []int{30}, // never exists
+	Dtstart:    time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC),
+})
+res := r.AnalyzeEmpty()
+fmt.Println(res.Status)             // EMPTY-PROVEN
+fmt.Println(res.Decisive[0].Item)   // BYMONTHDAY=30
+```
+
+Supported scope is pure date semantics in UTC for
+`DAILY`/`WEEKLY`/`MONTHLY`/`YEARLY` with the date-level filters
+(`BYMONTH`, `BYMONTHDAY`, `BYYEARDAY`, `BYWEEKNO`, `BYDAY`, `BYSETPOS`).
+Finite `UNTIL`, `COUNT=0` (meaning unlimited) and no-end rules are handled
+separately.
+
 ### rrule.StrToRRuleSet
 
 ```go
