@@ -877,12 +877,14 @@ func (s *reusingRemainSlice) Pop() (ret time.Time, ok bool) {
 	return ret, true
 }
 
-// Iterator return an iterator for RRule
-func (r *RRule) Iterator() Next {
+// newIterator builds an rIterator starting at the given civil time,
+// expressed in the rule's DTSTART location.
+func (r *RRule) newIterator(year int, month time.Month, day, hour, minute, second int) *rIterator {
 	iterator := rIterator{}
-	iterator.year, iterator.month, iterator.day = r.dtstart.Date()
-	iterator.hour, iterator.minute, iterator.second = r.dtstart.Clock()
-	iterator.weekday = toPyWeekday(r.dtstart.Weekday())
+	iterator.year, iterator.month, iterator.day = year, month, day
+	iterator.hour, iterator.minute, iterator.second = hour, minute, second
+	iterator.weekday = toPyWeekday(time.Date(
+		year, month, day, 0, 0, 0, 0, r.dtstart.Location()).Weekday())
 
 	iterator.ii = iterInfo{rrule: r}
 	iterator.ii.rebuild(iterator.year, iterator.month)
@@ -899,7 +901,162 @@ func (r *RRule) Iterator() Next {
 		}
 	}
 	iterator.count = r.count
-	return iterator.next
+	return &iterator
+}
+
+// Iterator return an iterator for RRule
+func (r *RRule) Iterator() Next {
+	year, month, day := r.dtstart.Date()
+	hour, minute, second := r.dtstart.Clock()
+	return r.newIterator(year, month, day, hour, minute, second).next
+}
+
+// jumpIterator returns an iterator positioned at the beginning of the
+// interval-aligned frequency period that contains t, together with the
+// start time of that period. t must not be before the rule's DTSTART.
+// The jumped position is computed arithmetically from DTSTART and
+// INTERVAL, so no occurrences between DTSTART and t are generated.
+func (r *RRule) jumpIterator(t time.Time) (*rIterator, time.Time) {
+	year, month, day := r.dtstart.Date()
+	hour, minute, second := r.dtstart.Clock()
+	loc := r.dtstart.Location()
+	var periodStart time.Time
+
+	switch r.freq {
+	case YEARLY:
+		year += ((t.Year() - year) / r.interval) * r.interval
+		periodStart = time.Date(year, time.January, 1, 0, 0, 0, 0, loc)
+	case MONTHLY:
+		n := ((t.Year()-year)*12 + int(t.Month()) - int(month)) / r.interval
+		total := year*12 + int(month) - 1 + n*r.interval
+		year, month = total/12, time.Month(total%12+1)
+		periodStart = time.Date(year, month, 1, 0, 0, 0, 0, loc)
+	case WEEKLY:
+		first := weekStartOf(r.dtstart, r.wkst)
+		n := daysBetween(first, weekStartOf(t, r.wkst)) / (7 * r.interval)
+		jumped := first.AddDate(0, 0, n*7*r.interval)
+		year, month, day = jumped.Date()
+		periodStart = time.Date(year, month, day, 0, 0, 0, 0, loc)
+	case DAILY:
+		n := daysBetween(r.dtstart, t) / r.interval
+		jumped := time.Date(year, month, day+n*r.interval, 0, 0, 0, 0, loc)
+		year, month, day = jumped.Date()
+		periodStart = time.Date(year, month, day, 0, 0, 0, 0, loc)
+	case HOURLY:
+		n := (daysBetween(r.dtstart, t)*24 + t.Hour() - hour) / r.interval
+		jumped := time.Date(year, month, day, hour+n*r.interval, minute, second, 0, loc)
+		year, month, day = jumped.Date()
+		hour = jumped.Hour()
+		periodStart = time.Date(year, month, day, hour, 0, 0, 0, loc)
+	case MINUTELY:
+		n := (daysBetween(r.dtstart, t)*1440 + t.Hour()*60 + t.Minute() - (hour*60 + minute)) / r.interval
+		jumped := time.Date(year, month, day, hour, minute+n*r.interval, second, 0, loc)
+		year, month, day = jumped.Date()
+		hour, minute = jumped.Hour(), jumped.Minute()
+		periodStart = time.Date(year, month, day, hour, minute, 0, 0, loc)
+	case SECONDLY:
+		n := (daysBetween(r.dtstart, t)*86400 + t.Hour()*3600 + t.Minute()*60 + t.Second() -
+			(hour*3600 + minute*60 + second)) / r.interval
+		jumped := time.Date(year, month, day, hour, minute, second+n*r.interval, 0, loc)
+		year, month, day = jumped.Date()
+		hour, minute, second = jumped.Hour(), jumped.Minute(), jumped.Second()
+		periodStart = time.Date(year, month, day, hour, minute, second, 0, loc)
+	}
+
+	iterator := r.newIterator(year, month, day, hour, minute, second)
+	// COUNT is resolved by ReverseIterator before jumping; a jumped
+	// iterator must emit every occurrence of its period.
+	iterator.count = 0
+	return iterator, periodStart
+}
+
+var emptyNext Next = func() (time.Time, bool) {
+	return time.Time{}, false
+}
+
+// ReverseIterator returns an iterator that yields the occurrences of the
+// RRule inside the closed interval [start, end] in descending
+// (reverse chronological) order. Only the delivery order is reversed, the
+// rule semantics are unchanged: negative BYMONTHDAY, ordinal BYDAY, WKST
+// and BYSETPOS are still selected within their normal (forward) periods,
+// so the result is exactly the reverse of r.Between(start, end, true).
+//
+// Unlike Before/Between, occurrences are not scanned one by one from
+// DTSTART. For rules without COUNT the iterator jumps directly to the
+// interval-aligned frequency period containing end and walks backwards
+// period by period, buffering at most one period of occurrences at a
+// time, so taking the last few occurrences of a narrow window costs
+// O(window) instead of O(total occurrences).
+//
+// COUNT still limits the first N occurrences of the forward stream, so
+// for rules with COUNT a single streaming forward pass (O(COUNT) time,
+// O(1) memory) is performed once to locate where the counted occurrences
+// end; results are never collected into a slice and reversed.
+//
+// It is only supported second precision.
+func (r *RRule) ReverseIterator(start, end time.Time) Next {
+	if end.After(r.until) {
+		end = r.until
+	}
+	if r.count != 0 {
+		// COUNT limits the first N occurrences of the forward stream, so
+		// the end of the counted occurrences can only be found by a single
+		// streaming forward pass (O(COUNT) time, O(1) memory).
+		next := r.Iterator()
+		var last time.Time
+		for {
+			t, ok := next()
+			if !ok {
+				break
+			}
+			last = t
+		}
+		if last.IsZero() {
+			return emptyNext
+		}
+		if last.Before(end) {
+			end = last
+		}
+	}
+	if end.Before(start) || end.Before(r.dtstart) {
+		return emptyNext
+	}
+	// Work on a copy so that jumped iterators hitting UNTIL never mutate
+	// the receiver's cached length.
+	rcopy := *r
+	r = &rcopy
+
+	cur := end
+	var chunk []time.Time
+	delivered := 0
+	return func() (time.Time, bool) {
+		for {
+			if delivered < len(chunk) {
+				t := chunk[len(chunk)-1-delivered]
+				if t.Before(start) {
+					return time.Time{}, false
+				}
+				delivered++
+				return t, true
+			}
+			// All remaining occurrences are <= cur; stop once cur drops
+			// below the window or the rule's DTSTART.
+			if cur.Before(start) || cur.Before(r.dtstart) {
+				return time.Time{}, false
+			}
+			iterator, periodStart := r.jumpIterator(cur)
+			chunk = chunk[:0]
+			delivered = 0
+			for {
+				t, ok := iterator.next()
+				if !ok || t.After(cur) {
+					break
+				}
+				chunk = append(chunk, t)
+			}
+			cur = periodStart.Add(-time.Second)
+		}
+	}
 }
 
 // All returns all occurrences of the RRule.

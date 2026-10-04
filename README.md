@@ -171,6 +171,42 @@ func ExampleStrToRRuleSet() {
 }
 ```
 
+### Reverse iteration
+
+`RRule.ReverseIterator(start, end)` and `Set.ReverseIterator(start, end)` yield the
+occurrences inside the closed interval `[start, end]` in descending (reverse
+chronological) order. Only the delivery order is reversed; the rule semantics are
+unchanged, so the result is exactly the reverse of `Between(start, end, true)`.
+
+Unlike `Before`/`Between`, rules without `COUNT` do not scan forward from `DTSTART`:
+the iterator jumps directly to the period containing `end` and walks backwards period
+by period, so taking the 10 most recent events of a narrow window costs O(window)
+instead of O(total occurrences). For rules with `COUNT` (which limits the first N
+forward occurrences) a single streaming forward pass is performed once to locate the
+end of the counted occurrences.
+
+```go
+r, _ := rrule.NewRRule(rrule.ROption{
+	Freq:    rrule.DAILY,
+	Dtstart: time.Date(1990, 1, 1, 9, 0, 0, 0, time.UTC),
+})
+
+// The 10 most recent occurrences of 2026, latest first.
+next := r.ReverseIterator(
+	time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
+	time.Date(2026, 12, 31, 23, 59, 59, 0, time.UTC))
+for i := 0; i < 10; i++ {
+	t, ok := next()
+	if !ok {
+		break
+	}
+	fmt.Println(t)
+}
+// 2026-12-31 09:00:00 +0000 UTC
+// 2026-12-30 09:00:00 +0000 UTC
+// ...
+```
+
 For more examples see [python-dateutil](http://labix.org/python-dateutil/) documentation.
 
 ## License

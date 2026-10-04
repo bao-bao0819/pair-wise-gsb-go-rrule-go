@@ -174,6 +174,70 @@ func (set *Set) Iterator() (next func() (time.Time, bool)) {
 	}
 }
 
+// ReverseIterator returns an iterator that yields the occurrences of the
+// rrule.Set inside the closed interval [start, end] in descending
+// (reverse chronological) order. The RRULE stream, RDATEs and EXDATEs are
+// merged and deduplicated in reverse order, so the result is exactly the
+// reverse of set.Between(start, end, true). The date slices held by the
+// set are copied first and are never sorted or modified in place.
+// It is only supported second precision.
+func (set *Set) ReverseIterator(start, end time.Time) Next {
+	rdates := make([]time.Time, 0, len(set.rdate))
+	for _, dt := range set.rdate {
+		if !dt.Before(start) && !dt.After(end) {
+			rdates = append(rdates, dt)
+		}
+	}
+	sort.Sort(timeSlice(rdates))
+
+	exdates := make([]time.Time, 0, len(set.exdate))
+	for _, dt := range set.exdate {
+		if !dt.Before(start) && !dt.After(end) {
+			exdates = append(exdates, dt)
+		}
+	}
+	sort.Sort(timeSlice(exdates))
+
+	var ruleNext Next
+	var ruleDt time.Time
+	var ruleOk bool
+	if set.rrule != nil {
+		ruleNext = set.rrule.ReverseIterator(start, end)
+		ruleDt, ruleOk = ruleNext()
+	}
+
+	ri := len(rdates) - 1
+	ei := len(exdates) - 1
+	var last time.Time
+	hasLast := false
+
+	return func() (time.Time, bool) {
+		for {
+			var dt time.Time
+			if ruleOk && (ri < 0 || !ruleDt.Before(rdates[ri])) {
+				dt = ruleDt
+				ruleDt, ruleOk = ruleNext()
+			} else if ri >= 0 {
+				dt = rdates[ri]
+				ri--
+			} else {
+				return time.Time{}, false
+			}
+			if hasLast && dt.Equal(last) {
+				continue
+			}
+			for ei >= 0 && exdates[ei].After(dt) {
+				ei--
+			}
+			last, hasLast = dt, true
+			if ei >= 0 && exdates[ei].Equal(dt) {
+				continue
+			}
+			return dt, true
+		}
+	}
+}
+
 // All returns all occurrences of the rrule.Set.
 // It is only supported second precision.
 func (set *Set) All() []time.Time {

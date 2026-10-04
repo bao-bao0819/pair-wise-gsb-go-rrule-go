@@ -121,6 +121,24 @@ func timeSliceIterator(s []time.Time) func() (time.Time, bool) {
 	}
 }
 
+// daysBetween returns the number of whole calendar days between the dates
+// of a and b, ignoring the time of day and DST transitions.
+func daysBetween(a, b time.Time) int {
+	ay, am, ad := a.Date()
+	by, bm, bd := b.Date()
+	au := time.Date(ay, am, ad, 0, 0, 0, 0, time.UTC)
+	bu := time.Date(by, bm, bd, 0, 0, 0, 0, time.UTC)
+	return int(bu.Sub(au).Hours() / 24)
+}
+
+// weekStartOf returns the midnight that starts the week (according to wkst)
+// containing t.
+func weekStartOf(t time.Time, wkst int) time.Time {
+	year, month, day := t.Date()
+	midnight := time.Date(year, month, day, 0, 0, 0, 0, t.Location())
+	return midnight.AddDate(0, 0, -pymod(toPyWeekday(t.Weekday())-wkst, 7))
+}
+
 func easter(year int) time.Time {
 	g := year % 19
 	c := year / 100
