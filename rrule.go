@@ -556,6 +556,24 @@ func prepareTimeSet(set *[]time.Time, length int) {
 	*set = (*set)[:0]
 }
 
+func (info *iterInfo) dayMatches(r *RRule, dayIndex int) bool {
+	return (len(r.bymonth) == 0 || contains(r.bymonth, info.mmask[dayIndex])) &&
+		(len(r.byweekno) == 0 || info.wnomask[dayIndex] == 1) &&
+		(len(r.byweekday) == 0 || contains(r.byweekday, info.wdaymask[dayIndex])) &&
+		(len(info.nwdaymask) == 0 || info.nwdaymask[dayIndex] == 1) &&
+		(len(r.byeaster) == 0 || info.eastermask[dayIndex] == 1) &&
+		((len(r.bymonthday) == 0 && len(r.bynmonthday) == 0) ||
+			contains(r.bymonthday, info.mdaymask[dayIndex]) ||
+			contains(r.bynmonthday, info.nmdaymask[dayIndex])) &&
+		(len(r.byyearday) == 0 ||
+			(dayIndex < info.yearlen &&
+				(contains(r.byyearday, dayIndex+1) ||
+					contains(r.byyearday, -info.yearlen+dayIndex))) ||
+			(dayIndex >= info.yearlen &&
+				(contains(r.byyearday, dayIndex+1-info.yearlen) ||
+					contains(r.byyearday, -info.nextyearlen+dayIndex-info.yearlen))))
+}
+
 // rIterator is a iterator of RRule
 type rIterator struct {
 	year     int
@@ -591,21 +609,7 @@ func (iterator *rIterator) generate() {
 		// Do the "hard" work ;-)
 		for dayIndex, day := range dayset {
 			i := day.Int
-			if len(r.bymonth) != 0 && !contains(r.bymonth, iterator.ii.mmask[i]) ||
-				len(r.byweekno) != 0 && iterator.ii.wnomask[i] == 0 ||
-				len(r.byweekday) != 0 && !contains(r.byweekday, iterator.ii.wdaymask[i]) ||
-				len(iterator.ii.nwdaymask) != 0 && iterator.ii.nwdaymask[i] == 0 ||
-				len(r.byeaster) != 0 && iterator.ii.eastermask[i] == 0 ||
-				(len(r.bymonthday) != 0 || len(r.bynmonthday) != 0) &&
-					!contains(r.bymonthday, iterator.ii.mdaymask[i]) &&
-					!contains(r.bynmonthday, iterator.ii.nmdaymask[i]) ||
-				len(r.byyearday) != 0 &&
-					(i < iterator.ii.yearlen &&
-						!contains(r.byyearday, i+1) &&
-						!contains(r.byyearday, -iterator.ii.yearlen+i) ||
-						i >= iterator.ii.yearlen &&
-							!contains(r.byyearday, i+1-iterator.ii.yearlen) &&
-							!contains(r.byyearday, -iterator.ii.nextyearlen+i-iterator.ii.yearlen)) {
+			if !iterator.ii.dayMatches(r, i) {
 				dayset[dayIndex].Defined = false
 				filtered = true
 			}
