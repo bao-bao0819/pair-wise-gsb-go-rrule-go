@@ -381,3 +381,108 @@ func TestRuleSetChangeDTStartTimezoneRespected(t *testing.T) {
 		}
 	}
 }
+
+func TestSetReverseIterator(t *testing.T) {
+	set := Set{}
+	r, _ := NewRRule(ROption{Freq: WEEKLY, Byweekday: []Weekday{TU},
+		Dtstart: time.Date(1997, 9, 2, 9, 0, 0, 0, time.UTC)})
+	set.RRule(r)
+	start := time.Date(1997, 9, 9, 9, 0, 0, 0, time.UTC)
+	end := time.Date(1997, 10, 14, 9, 0, 0, 0, time.UTC)
+	// Exclusion exactly on the window boundary.
+	set.ExDate(start)
+	// RDATE duplicating a rule occurrence must be delivered only once.
+	set.RDate(time.Date(1997, 9, 16, 9, 0, 0, 0, time.UTC))
+	// Extra RDATE inside the window.
+	set.RDate(time.Date(1997, 9, 20, 9, 0, 0, 0, time.UTC))
+	// RDATE outside the window must be ignored.
+	set.RDate(time.Date(1998, 1, 1, 9, 0, 0, 0, time.UTC))
+
+	want := reverseTimes(set.Between(start, end, true))
+	value := collectNext(set.ReverseIterator(start, end))
+	if !timesEqual(value, want) {
+		t.Errorf("get %v, want %v", value, want)
+	}
+	for _, excluded := range []time.Time{start} {
+		for _, v := range value {
+			if v.Equal(excluded) {
+				t.Errorf("excluded date %v delivered", excluded)
+			}
+		}
+	}
+}
+
+func TestSetReverseIteratorOnlyRDates(t *testing.T) {
+	set := Set{}
+	set.RDate(time.Date(1997, 9, 2, 9, 0, 0, 0, time.UTC))
+	set.RDate(time.Date(1997, 9, 9, 9, 0, 0, 0, time.UTC))
+	set.RDate(time.Date(1997, 9, 9, 9, 0, 0, 0, time.UTC))
+	set.ExDate(time.Date(1997, 9, 2, 9, 0, 0, 0, time.UTC))
+	start := time.Date(1997, 9, 1, 0, 0, 0, 0, time.UTC)
+	end := time.Date(1997, 9, 30, 0, 0, 0, 0, time.UTC)
+	want := []time.Time{time.Date(1997, 9, 9, 9, 0, 0, 0, time.UTC)}
+	value := collectNext(set.ReverseIterator(start, end))
+	if !timesEqual(value, want) {
+		t.Errorf("get %v, want %v", value, want)
+	}
+}
+
+func TestSetReverseIteratorKeepsSlices(t *testing.T) {
+	rdates := []time.Time{
+		time.Date(1997, 9, 20, 9, 0, 0, 0, time.UTC),
+		time.Date(1997, 9, 4, 9, 0, 0, 0, time.UTC),
+		time.Date(1997, 9, 12, 9, 0, 0, 0, time.UTC),
+	}
+	exdates := []time.Time{
+		time.Date(1997, 9, 12, 9, 0, 0, 0, time.UTC),
+		time.Date(1997, 9, 4, 9, 0, 0, 0, time.UTC),
+	}
+	set := Set{}
+	set.SetRDates(rdates)
+	set.SetExDates(exdates)
+	start := time.Date(1997, 9, 1, 0, 0, 0, 0, time.UTC)
+	end := time.Date(1997, 9, 30, 0, 0, 0, 0, time.UTC)
+	want := []time.Time{time.Date(1997, 9, 20, 9, 0, 0, 0, time.UTC)}
+	value := collectNext(set.ReverseIterator(start, end))
+	if !timesEqual(value, want) {
+		t.Errorf("get %v, want %v", value, want)
+	}
+	// Neither the caller's slices nor the set's internal ones may be
+	// sorted or modified by the reverse iteration.
+	if !timesEqual(rdates, []time.Time{
+		time.Date(1997, 9, 20, 9, 0, 0, 0, time.UTC),
+		time.Date(1997, 9, 4, 9, 0, 0, 0, time.UTC),
+		time.Date(1997, 9, 12, 9, 0, 0, 0, time.UTC),
+	}) {
+		t.Errorf("caller rdates modified: %v", rdates)
+	}
+	if !timesEqual(exdates, []time.Time{
+		time.Date(1997, 9, 12, 9, 0, 0, 0, time.UTC),
+		time.Date(1997, 9, 4, 9, 0, 0, 0, time.UTC),
+	}) {
+		t.Errorf("caller exdates modified: %v", exdates)
+	}
+	if !timesEqual(set.GetRDate(), rdates) {
+		t.Errorf("set rdates modified: %v", set.GetRDate())
+	}
+	if !timesEqual(set.GetExDate(), exdates) {
+		t.Errorf("set exdates modified: %v", set.GetExDate())
+	}
+}
+
+func TestSetReverseIteratorJumpWindow(t *testing.T) {
+	set := Set{}
+	r, _ := NewRRule(ROption{Freq: DAILY, Interval: 3,
+		Dtstart: time.Date(1970, 1, 1, 9, 0, 0, 0, time.UTC)})
+	set.RRule(r)
+	start := time.Date(2026, 12, 25, 0, 0, 0, 0, time.UTC)
+	end := time.Date(2026, 12, 31, 23, 59, 59, 0, time.UTC)
+	want := reverseTimes(set.Between(start, end, true))
+	value := collectNext(set.ReverseIterator(start, end))
+	if !timesEqual(value, want) {
+		t.Errorf("get %v, want %v", value, want)
+	}
+	if len(value) == 0 {
+		t.Error("expected occurrences in window")
+	}
+}

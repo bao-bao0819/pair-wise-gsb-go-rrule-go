@@ -174,6 +174,71 @@ func (set *Set) Iterator() (next func() (time.Time, bool)) {
 	}
 }
 
+// ReverseIterator returns an iterator that yields the occurrences of the
+// rrule.Set within the closed interval [start, end] in descending (most
+// recent first) order. RDATE and EXDATE lists are merged with the rule
+// stream and deduplicated on copies, so the slices held by the set (and
+// by the caller) are never sorted or modified.
+func (set *Set) ReverseIterator(start, end time.Time) Next {
+	inWindow := func(t time.Time) bool {
+		return !t.Before(start) && !t.After(end)
+	}
+	rdates := make([]time.Time, 0, len(set.rdate))
+	for _, dt := range set.rdate {
+		if inWindow(dt) {
+			rdates = append(rdates, dt)
+		}
+	}
+	sort.Sort(sort.Reverse(timeSlice(rdates)))
+	exdates := make([]time.Time, 0, len(set.exdate))
+	for _, dt := range set.exdate {
+		if inWindow(dt) {
+			exdates = append(exdates, dt)
+		}
+	}
+	sort.Sort(sort.Reverse(timeSlice(exdates)))
+
+	var rruleNext Next
+	var rruleValue time.Time
+	var rruleOK bool
+	if set.rrule != nil {
+		rruleNext = set.rrule.ReverseIterator(start, end)
+		rruleValue, rruleOK = rruleNext()
+	}
+	ri := 0
+	ei := 0
+	lastdt := time.Time{}
+	hasLast := false
+	return func() (time.Time, bool) {
+		for {
+			var dt time.Time
+			ok := false
+			if rruleOK && (ri >= len(rdates) || !rdates[ri].After(rruleValue)) {
+				dt, ok = rruleValue, true
+				rruleValue, rruleOK = rruleNext()
+			} else if ri < len(rdates) {
+				dt, ok = rdates[ri], true
+				ri++
+			}
+			if !ok {
+				return time.Time{}, false
+			}
+			if hasLast && lastdt.Equal(dt) {
+				continue
+			}
+			for ei < len(exdates) && exdates[ei].After(dt) {
+				ei++
+			}
+			lastdt = dt
+			hasLast = true
+			if ei < len(exdates) && exdates[ei].Equal(dt) {
+				continue
+			}
+			return dt, true
+		}
+	}
+}
+
 // All returns all occurrences of the rrule.Set.
 // It is only supported second precision.
 func (set *Set) All() []time.Time {

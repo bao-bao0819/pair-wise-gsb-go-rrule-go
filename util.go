@@ -42,6 +42,14 @@ func daysIn(m time.Month, year int) int {
 	return time.Date(year, m+1, 0, 0, 0, 0, 0, time.UTC).Day()
 }
 
+// ordinalDays returns the number of days between the unix epoch and t's
+// calendar date, computed in UTC so the result does not depend on the
+// location of t (e.g. DST transitions).
+func ordinalDays(t time.Time) int {
+	y, m, d := t.Date()
+	return int(time.Date(y, m, d, 0, 0, 0, 0, time.UTC).Unix() / 86400)
+}
+
 // mod in Python
 func pymod(a, b int) int {
 	r := a % b

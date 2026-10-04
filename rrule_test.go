@@ -19,6 +19,25 @@ func timesEqual(value, want []time.Time) bool {
 	return true
 }
 
+func reverseTimes(s []time.Time) []time.Time {
+	out := make([]time.Time, len(s))
+	for i, v := range s {
+		out[len(s)-1-i] = v
+	}
+	return out
+}
+
+func collectNext(next Next) []time.Time {
+	result := []time.Time{}
+	for {
+		v, ok := next()
+		if !ok {
+			return result
+		}
+		result = append(result, v)
+	}
+}
+
 func TestNoDtstart(t *testing.T) {
 	r, _ := NewRRule(ROption{Freq: MONTHLY})
 	if time.Now().Unix()-r.dtstart.Unix() > 1 {
@@ -4009,4 +4028,182 @@ func iterateNum(iter Next, num int) (last time.Time) {
 		}
 	}
 	return last
+}
+
+func TestReverseIteratorNegativeMonthday(t *testing.T) {
+	r, _ := NewRRule(ROption{Freq: MONTHLY,
+		Bymonthday: []int{-1},
+		Dtstart:    time.Date(1997, 9, 2, 9, 0, 0, 0, time.UTC)})
+	start := time.Date(1998, 1, 1, 0, 0, 0, 0, time.UTC)
+	end := time.Date(1998, 6, 30, 23, 59, 59, 0, time.UTC)
+	want := reverseTimes(r.Between(start, end, true))
+	value := collectNext(r.ReverseIterator(start, end))
+	if !timesEqual(value, want) {
+		t.Errorf("get %v, want %v", value, want)
+	}
+	if len(value) == 0 {
+		t.Error("expected occurrences in window")
+	}
+}
+
+func TestReverseIteratorOrdinalWeekday(t *testing.T) {
+	r, _ := NewRRule(ROption{Freq: MONTHLY,
+		Byweekday: []Weekday{FR.Nth(-1)},
+		Dtstart:   time.Date(1997, 9, 2, 9, 0, 0, 0, time.UTC)})
+	start := time.Date(1998, 1, 1, 0, 0, 0, 0, time.UTC)
+	end := time.Date(1998, 12, 31, 23, 59, 59, 0, time.UTC)
+	want := reverseTimes(r.Between(start, end, true))
+	value := collectNext(r.ReverseIterator(start, end))
+	if !timesEqual(value, want) {
+		t.Errorf("get %v, want %v", value, want)
+	}
+}
+
+func TestReverseIteratorBysetpos(t *testing.T) {
+	r, _ := NewRRule(ROption{Freq: MONTHLY,
+		Bysetpos:  []int{1, -1},
+		Byweekday: []Weekday{MO, TU, WE, TH, FR},
+		Dtstart:   time.Date(1997, 9, 2, 9, 0, 0, 0, time.UTC)})
+	start := time.Date(1998, 3, 1, 0, 0, 0, 0, time.UTC)
+	end := time.Date(1998, 8, 31, 23, 59, 59, 0, time.UTC)
+	want := reverseTimes(r.Between(start, end, true))
+	value := collectNext(r.ReverseIterator(start, end))
+	if !timesEqual(value, want) {
+		t.Errorf("get %v, want %v", value, want)
+	}
+}
+
+func TestReverseIteratorCrossYearWeek(t *testing.T) {
+	r, _ := NewRRule(ROption{Freq: WEEKLY,
+		Wkst:      MO,
+		Byweekday: []Weekday{SU},
+		Dtstart:   time.Date(2020, 12, 20, 9, 0, 0, 0, time.UTC)})
+	start := time.Date(2020, 12, 21, 0, 0, 0, 0, time.UTC)
+	end := time.Date(2021, 1, 10, 23, 59, 59, 0, time.UTC)
+	want := reverseTimes(r.Between(start, end, true))
+	value := collectNext(r.ReverseIterator(start, end))
+	if !timesEqual(value, want) {
+		t.Errorf("get %v, want %v", value, want)
+	}
+	if len(value) != 3 {
+		t.Errorf("get %d occurrences, want 3", len(value))
+	}
+}
+
+func TestReverseIteratorCount(t *testing.T) {
+	r, _ := NewRRule(ROption{Freq: MONTHLY,
+		Count:      10,
+		Bymonthday: []int{-1},
+		Dtstart:    time.Date(2020, 1, 31, 9, 0, 0, 0, time.UTC)})
+	start := time.Date(2020, 8, 1, 0, 0, 0, 0, time.UTC)
+	end := time.Date(2020, 12, 31, 23, 59, 59, 0, time.UTC)
+	var forward []time.Time
+	for _, v := range r.All() {
+		if !v.Before(start) && !v.After(end) {
+			forward = append(forward, v)
+		}
+	}
+	want := reverseTimes(forward)
+	value := collectNext(r.ReverseIterator(start, end))
+	if !timesEqual(value, want) {
+		t.Errorf("get %v, want %v", value, want)
+	}
+	if len(value) != 3 {
+		t.Errorf("get %d occurrences, want 3 (COUNT limits the forward stream)", len(value))
+	}
+}
+
+func TestReverseIteratorInclusiveBounds(t *testing.T) {
+	r, _ := NewRRule(ROption{Freq: DAILY,
+		Dtstart: time.Date(2021, 1, 1, 9, 0, 0, 0, time.UTC)})
+	start := time.Date(2021, 1, 3, 9, 0, 0, 0, time.UTC)
+	end := time.Date(2021, 1, 5, 9, 0, 0, 0, time.UTC)
+	want := []time.Time{
+		time.Date(2021, 1, 5, 9, 0, 0, 0, time.UTC),
+		time.Date(2021, 1, 4, 9, 0, 0, 0, time.UTC),
+		time.Date(2021, 1, 3, 9, 0, 0, 0, time.UTC),
+	}
+	value := collectNext(r.ReverseIterator(start, end))
+	if !timesEqual(value, want) {
+		t.Errorf("get %v, want %v", value, want)
+	}
+}
+
+func TestReverseIteratorEmptyWindow(t *testing.T) {
+	r, _ := NewRRule(ROption{Freq: DAILY,
+		Dtstart: time.Date(2021, 1, 1, 9, 0, 0, 0, time.UTC)})
+	// end before start
+	if v := collectNext(r.ReverseIterator(
+		time.Date(2021, 2, 1, 0, 0, 0, 0, time.UTC),
+		time.Date(2021, 1, 1, 0, 0, 0, 0, time.UTC))); len(v) != 0 {
+		t.Errorf("get %v, want empty", v)
+	}
+	// window before dtstart
+	if v := collectNext(r.ReverseIterator(
+		time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC),
+		time.Date(2020, 12, 31, 0, 0, 0, 0, time.UTC))); len(v) != 0 {
+		t.Errorf("get %v, want empty", v)
+	}
+}
+
+func TestReverseIteratorJump(t *testing.T) {
+	dtstart := time.Date(1997, 9, 2, 9, 0, 0, 0, time.UTC)
+	start := time.Date(2026, 12, 1, 0, 0, 0, 0, time.UTC)
+	end := time.Date(2026, 12, 31, 23, 59, 59, 0, time.UTC)
+	for _, c := range []struct {
+		name string
+		opt  ROption
+	}{
+		{"yearly", ROption{Freq: YEARLY, Interval: 2, Dtstart: dtstart}},
+		{"monthly", ROption{Freq: MONTHLY, Interval: 3, Dtstart: dtstart}},
+		{"weekly", ROption{Freq: WEEKLY, Interval: 2, Wkst: MO, Dtstart: dtstart}},
+		{"daily", ROption{Freq: DAILY, Interval: 5, Dtstart: dtstart}},
+		{"hourly", ROption{Freq: HOURLY, Interval: 7, Dtstart: dtstart}},
+		{"minutely", ROption{Freq: MINUTELY, Interval: 90, Dtstart: dtstart}},
+		{"secondly", ROption{Freq: SECONDLY, Interval: 3601, Dtstart: dtstart}},
+		{"filtered", ROption{Freq: MONTHLY, Bymonthday: []int{-1}, Bysetpos: []int{1}, Dtstart: dtstart}},
+	} {
+		r, err := NewRRule(c.opt)
+		if err != nil {
+			t.Errorf("%s: failed to init rrule: %s", c.name, err)
+			continue
+		}
+		want := reverseTimes(r.Between(start, end, true))
+		value := collectNext(r.ReverseIterator(start, end))
+		if !timesEqual(value, want) {
+			t.Errorf("%s: get %v, want %v", c.name, value, want)
+		}
+	}
+}
+
+func TestReverseIteratorJumpCursor(t *testing.T) {
+	r, _ := NewRRule(ROption{Freq: DAILY,
+		Dtstart: time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC)})
+	it := r.iterator()
+	it.jumpTo(time.Date(2026, 12, 1, 0, 0, 0, 0, time.UTC))
+	if it.year != 2026 || it.month != 12 || it.day != 1 {
+		t.Errorf("jumpTo landed on %d-%02d-%02d, want 2026-12-01", it.year, it.month, it.day)
+	}
+	v, ok := it.next()
+	if !ok || !v.Equal(time.Date(2026, 12, 1, 0, 0, 0, 0, time.UTC)) {
+		t.Errorf("get %v, %v, want 2026-12-01, true", v, ok)
+	}
+}
+
+func TestReverseIteratorLastTenOf2026(t *testing.T) {
+	r, _ := NewRRule(ROption{Freq: DAILY,
+		Dtstart: time.Date(1997, 9, 2, 9, 0, 0, 0, time.UTC)})
+	start := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	end := time.Date(2026, 12, 31, 23, 59, 59, 0, time.UTC)
+	next := r.ReverseIterator(start, end)
+	for i := 0; i < 10; i++ {
+		v, ok := next()
+		if !ok {
+			t.Fatalf("iterator exhausted after %d values", i)
+		}
+		want := time.Date(2026, 12, 31-i, 9, 0, 0, 0, time.UTC)
+		if !v.Equal(want) {
+			t.Errorf("get %v, want %v", v, want)
+		}
+	}
 }

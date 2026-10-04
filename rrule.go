@@ -879,6 +879,10 @@ func (s *reusingRemainSlice) Pop() (ret time.Time, ok bool) {
 
 // Iterator return an iterator for RRule
 func (r *RRule) Iterator() Next {
+	return r.iterator().next
+}
+
+func (r *RRule) iterator() *rIterator {
 	iterator := rIterator{}
 	iterator.year, iterator.month, iterator.day = r.dtstart.Date()
 	iterator.hour, iterator.minute, iterator.second = r.dtstart.Clock()
@@ -899,7 +903,160 @@ func (r *RRule) Iterator() Next {
 		}
 	}
 	iterator.count = r.count
-	return iterator.next
+	return &iterator
+}
+
+// jumpTo fast-forwards the iterator cursor to the recurrence period
+// containing t. It is only meaningful for rules without COUNT, because
+// COUNT limits the number of occurrences produced from DTSTART and
+// therefore requires streaming from the beginning. The cursor always
+// lands on a period boundary of the original forward grid that is not
+// after t, so no occurrence at or after t is skipped.
+func (iterator *rIterator) jumpTo(t time.Time) {
+	r := iterator.ii.rrule
+	dtstart := r.dtstart
+	if !t.After(dtstart) {
+		return
+	}
+	rebuild := func() {
+		if iterator.year > MAXYEAR {
+			r.len = iterator.total
+			iterator.finished = true
+			return
+		}
+		iterator.ii.rebuild(iterator.year, iterator.month)
+	}
+	switch r.freq {
+	case YEARLY:
+		n := (t.Year() - iterator.year) / r.interval
+		if n == 0 {
+			return
+		}
+		iterator.year += n * r.interval
+		rebuild()
+	case MONTHLY:
+		months := (t.Year()-iterator.year)*12 + int(t.Month()) - int(iterator.month)
+		n := months / r.interval
+		if n == 0 {
+			return
+		}
+		total := iterator.year*12 + int(iterator.month) - 1 + n*r.interval
+		iterator.year = total / 12
+		iterator.month = time.Month(total%12 + 1)
+		rebuild()
+	case WEEKLY:
+		back := pymod(toPyWeekday(dtstart.Weekday())-r.wkst, 7)
+		dtstartWeek := ordinalDays(dtstart) - back
+		tWeek := ordinalDays(t) - pymod(toPyWeekday(t.Weekday())-r.wkst, 7)
+		n := ((tWeek - dtstartWeek) / 7) / r.interval
+		if n == 0 {
+			return
+		}
+		y, m, d := dtstart.AddDate(0, 0, n*r.interval*7-back).Date()
+		iterator.year, iterator.month, iterator.day = y, m, d
+		iterator.weekday = r.wkst
+		rebuild()
+	case DAILY:
+		n := (ordinalDays(t) - ordinalDays(dtstart)) / r.interval
+		if n == 0 {
+			return
+		}
+		y, m, d := dtstart.AddDate(0, 0, n*r.interval).Date()
+		iterator.year, iterator.month, iterator.day = y, m, d
+		rebuild()
+	default:
+		// HOURLY, MINUTELY, SECONDLY: the grid is dtstart plus a whole
+		// number of interval units, expressed in wall-clock time.
+		var unitsPerDay, current, target int
+		day0 := ordinalDays(dtstart)
+		switch r.freq {
+		case HOURLY:
+			unitsPerDay = 24
+			current = day0*24 + iterator.hour
+			target = ordinalDays(t)*24 + t.Hour()
+		case MINUTELY:
+			unitsPerDay = 1440
+			current = day0*1440 + iterator.hour*60 + iterator.minute
+			target = ordinalDays(t)*1440 + t.Hour()*60 + t.Minute()
+		case SECONDLY:
+			unitsPerDay = 86400
+			current = day0*86400 + iterator.hour*3600 + iterator.minute*60 + iterator.second
+			target = ordinalDays(t)*86400 + t.Hour()*3600 + t.Minute()*60 + t.Second()
+		}
+		n := (target - current) / r.interval
+		if n == 0 {
+			return
+		}
+		current += n * r.interval
+		y, m, d := dtstart.AddDate(0, 0, current/unitsPerDay-day0).Date()
+		iterator.year, iterator.month, iterator.day = y, m, d
+		rem := current % unitsPerDay
+		switch r.freq {
+		case HOURLY:
+			iterator.hour = rem
+		case MINUTELY:
+			iterator.hour = rem / 60
+			iterator.minute = rem % 60
+		case SECONDLY:
+			iterator.hour = rem / 3600
+			iterator.minute = (rem % 3600) / 60
+			iterator.second = rem % 60
+		}
+		// Fill the timeset only when the jumped-to point passes the
+		// byhour/byminute/bysecond filters, mirroring the forward path.
+		if r.freq >= HOURLY && len(r.byhour) != 0 && !contains(r.byhour, iterator.hour) ||
+			r.freq >= MINUTELY && len(r.byminute) != 0 && !contains(r.byminute, iterator.minute) ||
+			r.freq >= SECONDLY && len(r.bysecond) != 0 && !contains(r.bysecond, iterator.second) {
+			iterator.timeset = nil
+		} else {
+			iterator.ii.fillTimeSet(&iterator.timeset, r.freq, iterator.hour, iterator.minute, iterator.second)
+		}
+		rebuild()
+	}
+}
+
+// ReverseIterator returns an iterator that yields the occurrences of the
+// RRule within the closed interval [start, end] in descending (most recent
+// first) order. Only the delivery order is reversed: the rule semantics
+// (negative BYMONTHDAY, ordinal BYDAY, WKST, BYSETPOS, ...) are still
+// evaluated on the normal forward periods, and COUNT still limits the
+// first N forward occurrences.
+//
+// When the rule has no COUNT, the cursor jumps directly to the period
+// containing start, so occurrences before the window are neither generated
+// nor stored. With COUNT, the occurrences before the window are streamed
+// once and discarded to locate the COUNT-limited tail, which costs one
+// forward pass but no extra storage. In both cases only the occurrences
+// inside the window are buffered, because the last one must be known
+// before the first one can be delivered.
+func (r *RRule) ReverseIterator(start, end time.Time) Next {
+	iterator := r.iterator()
+	if r.count == 0 {
+		iterator.jumpTo(start)
+	}
+	var window []time.Time
+	index := 0
+	loaded := false
+	return func() (time.Time, bool) {
+		if !loaded {
+			loaded = true
+			for {
+				v, ok := iterator.next()
+				if !ok || v.After(end) {
+					break
+				}
+				if !v.Before(start) {
+					window = append(window, v)
+				}
+			}
+			index = len(window)
+		}
+		if index == 0 {
+			return time.Time{}, false
+		}
+		index--
+		return window[index], true
+	}
 }
 
 // All returns all occurrences of the RRule.
