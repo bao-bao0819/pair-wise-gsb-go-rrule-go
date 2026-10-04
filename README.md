@@ -173,6 +173,34 @@ func ExampleStrToRRuleSet() {
 
 For more examples see [python-dateutil](http://labix.org/python-dateutil/) documentation.
 
+## Kind-preserving dates and times (DTValue)
+
+The classic `RRule`/`Set` API works on `time.Time`, which cannot
+distinguish the RFC 5545 value kinds. The `DTValue`-based API preserves
+them:
+
+- `KindDate` — a pure calendar date (`DTSTART;VALUE=DATE:20261003`)
+- `KindFloating` — a date-time with no zone (`DTSTART:20261003T090000`)
+- `KindTZID` — a local time with zone reference (`DTSTART;TZID=America/New_York:20261003T090000`)
+- `KindUTC` — a UTC time (`DTSTART:20261003T090000Z`)
+
+Parsing never attaches `time.Local` to floating values. Evaluating a
+floating rule to absolute instants requires an explicit location:
+
+```go
+r, _ := rrule.StrToDTRule("DTSTART:20261003T090000\nRRULE:FREQ=DAILY;COUNT=3")
+ny, _ := time.LoadLocation("America/New_York")
+occurrences, _ := r.All(ny) // floating wall clocks evaluated in ny
+```
+
+`UNTIL`, `RDATE` and `EXDATE` are validated against the `DTSTART` kind
+(e.g. a floating `DTSTART` requires a floating `UNTIL`; a zoned `DTSTART`
+requires a UTC `UNTIL`), and invalid combinations return an error instead
+of being silently converted. Pure-date rules iterate calendar dates and
+are queried with date bounds, independent of the server local zone.
+`DTRule`/`DTSet` share the recurrence computation with `RRule`/`Set`, and
+`String()` round-trips preserve the value kind and TZID.
+
 ## License
 
 Gear is licensed under the [MIT](https://github.com/teambition/gear/blob/master/LICENSE) license.
